@@ -1612,20 +1612,82 @@ func codexRelayedAccount(base string, h http.Header, on *provider.Provider) (pro
 var unreadableItem = regexp.MustCompile(`(?i)(?:encrypted content for item|item with id) '?([A-Za-z]+_[A-Za-z0-9_-]+)'?`)
 
 // withoutUnreadable is body without what OpenAI's refusal msg says it
-// can't read: the item it names, or the reasoning another account sealed.
+// can't read. A refused seal on a reasoning item retires all reasoning
+// seals at once, keeping their readable summaries: dropping one per try
+// exhausts the retry budget on a history from another provider.
 func withoutUnreadable(body, msg []byte) ([]byte, bool) {
 	if !foreignReasoning.Match(msg) && !bytes.Contains(bytes.ToLower(msg), []byte("not found")) {
 		return nil, false
 	}
 	if m := unreadableItem.FindSubmatch(msg); m != nil {
+		if foreignReasoning.Match(msg) {
+			if b, ok := reasoningSummaries(body, string(m[1])); ok {
+				return b, true
+			}
+		}
 		if b, ok := withoutItem(body, string(m[1])); ok {
 			return b, true
 		}
 	}
 	if foreignReasoning.Match(msg) {
-		return withoutReasoning(body)
+		return reasoningSummaries(body, "")
 	}
 	return nil, false
+}
+
+// reasoningSummaries replaces reasoning with ordinary assistant text only
+// after the backend rejects its encryption. The seal's origin can't be
+// inferred from its bytes; normal replay must leave it alone. If id is set,
+// it must name a reasoning item, not a tool result or opaque checkpoint.
+func reasoningSummaries(body []byte, id string) ([]byte, bool) {
+	var q map[string]json.RawMessage
+	if json.Unmarshal(body, &q) != nil {
+		return nil, false
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(q["input"], &items) != nil {
+		return nil, false
+	}
+	found, changed := id == "", false
+	kept := make([]json.RawMessage, 0, len(items))
+	for _, raw := range items {
+		var it struct {
+			Type, ID string
+			Summary  json.RawMessage
+		}
+		if json.Unmarshal(raw, &it) != nil {
+			return nil, false
+		}
+		if it.Type != "reasoning" {
+			kept = append(kept, raw)
+			continue
+		}
+		changed = true
+		found = found || it.ID == id
+		var summary []rText
+		if len(it.Summary) > 0 && json.Unmarshal(it.Summary, &summary) != nil {
+			return nil, false
+		}
+		var texts []string
+		for _, part := range summary {
+			if part.Type == "summary_text" && part.Text != "" {
+				texts = append(texts, part.Text)
+			}
+		}
+		if len(texts) > 0 {
+			message, _ := json.Marshal(map[string]any{
+				"type": "message", "role": "assistant",
+				"content": []rText{{Type: "output_text", Text: strings.Join(texts, "\n\n")}},
+			})
+			kept = append(kept, message)
+		}
+	}
+	if !found || !changed {
+		return nil, false
+	}
+	q["input"], _ = json.Marshal(kept)
+	b, err := marshalJSON(q)
+	return b, err == nil
 }
 
 // withoutItem is a Responses request without the input item of this id.
